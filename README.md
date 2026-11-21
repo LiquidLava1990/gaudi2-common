@@ -1,4 +1,6 @@
-# gaudi2-common
+# Intel Gaudi 2 vLLM Toolkit: Dockerfiles, Custom HPU Kernels and Launch Scripts
+
+`gaudi2-common` · [all Gaudi 2 recipes](https://github.com/LiquidLava1990)
 
 Shared build parts for serving large language models with vLLM on an 8-card Intel Gaudi 2 server. This repo holds the Dockerfiles, launch and guard scripts, vLLM-Gaudi patches, and three out-of-tree vLLM plugins that the per-model repos reuse. It also holds kernel design notes and benchmark and tuning write-ups.
 
