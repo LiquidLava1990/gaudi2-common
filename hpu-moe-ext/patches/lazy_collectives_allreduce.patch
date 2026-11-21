@@ -1,0 +1,23 @@
+diff --git a/opt/vllm-gaudi/vllm_gaudi/distributed/device_communicators/hpu_communicator.py b/opt/vllm-gaudi/vllm_gaudi/distributed/device_communicators/hpu_communicator.py
+index 48cdde2..8866c2a 100644
+--- a/opt/vllm-gaudi/vllm_gaudi/distributed/device_communicators/hpu_communicator.py
++++ b/opt/vllm-gaudi/vllm_gaudi/distributed/device_communicators/hpu_communicator.py
+@@ -39,7 +39,17 @@ class HpuCommunicator(DeviceCommunicatorBase):
+         # FIXME(kzawora): this is a workaround for a bug in Habana PT bridge
+         # occurring when PT_HPU_ENABLE_LAZY_COLLECTIVES=true env var is used
+         # (which is required for tensor parallel HPUGraph inference)
+-        htorch.core.mark_step()
++        #
++        # LAZY-COLLECTIVES FIX (hpu-moe-ext): gate the mark_step on is_lazy(),
++        # mirroring combine() below. Under LAZY mode (PT_HPU_LAZY_MODE=1 +
++        # PT_HPU_ENABLE_LAZY_COLLECTIVES=true) the collective is captured IN the
++        # HPUGraph, so the pre-collective mark_step is paid ONCE at capture, not
++        # per call. Under torch.compile/eager (PT_HPU_LAZY_MODE=0) this branch is
++        # skipped entirely (it was a pure ungraphed host-sync "tax" — ~2 row-parallel
++        # all_reduces/layer * N layers/token serialized the decode). The condition
++        # is identical to combine()'s, so behaviour under lazy is unchanged.
++        if htorch.utils.internal.is_lazy():
++            htorch.core.mark_step()
+         dist.all_reduce(input_, group=self.device_group)
+         return input_
+ 

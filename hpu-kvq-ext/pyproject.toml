@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hpu-kvq-ext"
+version = "0.1.0"
+description = "HPU TurboQuant sub-fp8 KV (k8v4: fp8-K + int4-V, Walsh-Hadamard, calibration-free) overlay for vllm-gaudi. GQA/MHA only; MLA stays fp8_inc. Out-of-tree, zero installed-file edits, gated (HPU_KVQ_READY)."
+requires-python = ">=3.10"
+
+# Loads AFTER stock vllm-gaudi, hpu-moe-ext ("04."), hpu-dsa-ext ("05.") so any
+# overrides win. Auto-discovered by vLLM via the general_plugins entry-point group.
+[project.entry-points."vllm.general_plugins"]
+"06.hpu_kvq_ext" = "hpu_kvq_ext:register"
+
+[tool.setuptools]
+packages = ["hpu_kvq_ext"]

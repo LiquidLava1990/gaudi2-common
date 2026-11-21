@@ -1,0 +1,17 @@
+# PINNED, deterministic vllm-gaudi build -> tag vllm-gaudi:0.21 (a FRESH tag; production :next untouched).
+# Fixes the floating-clone reproducibility gap: pins the plugin to the released v0.21.0 tag AND base vLLM to
+# the exact commit that tag validated against (from v0.21.0:VLLM_STABLE_COMMIT). Every rebuild is identical
+# and revertable. Same Habana FORK PT-2.10 base as :next (lazy-capable) -> no kernel/driver change.
+FROM vault.habana.ai/gaudi-docker/1.24.0/ubuntu24.04/habanalabs/pytorch-installer-2.10.0:latest
+SHELL ["/bin/bash", "-c"]
+ARG VLLM_GAUDI_REF=v0.21.0
+ARG VLLM_COMMIT=ad7125a431e176d4161099480a66f0169609a690
+RUN git clone https://github.com/vllm-project/vllm-gaudi /opt/vllm-gaudi && \
+    git clone https://github.com/vllm-project/vllm /opt/vllm && \
+    cd /opt/vllm-gaudi && git checkout "$VLLM_GAUDI_REF" && \
+    echo "PINNED vllm-gaudi=$VLLM_GAUDI_REF  vllm=$VLLM_COMMIT" && \
+    cd /opt/vllm && git checkout "$VLLM_COMMIT" && \
+    pip install -r <(sed '/^torch/d' requirements/build/cuda.txt) && \
+    VLLM_TARGET_DEVICE=empty pip install --no-build-isolation -e . && \
+    cd /opt/vllm-gaudi && pip install -e .
+WORKDIR /workspace

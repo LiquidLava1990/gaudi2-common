@@ -1,0 +1,16 @@
+# vLLM-Gaudi serving image for SynapseAI 1.24 (built on the upstream PyTorch 2.10 base).
+# Build: ./build.sh   (uses sudo docker until the docker-group login applies)
+FROM vault.habana.ai/gaudi-docker/1.24.0/ubuntu24.04/habanalabs/pytorch-upstream-installer-2.10.0:latest
+SHELL ["/bin/bash", "-c"]
+# Pin vLLM to the exact commit the gaudi plugin was validated against, build it device-agnostic,
+# then install the Gaudi hardware plugin on top.
+RUN git clone https://github.com/vllm-project/vllm-gaudi /opt/vllm-gaudi && \
+    git clone https://github.com/vllm-project/vllm /opt/vllm && \
+    cd /opt/vllm-gaudi && \
+    VLLM_COMMIT=$(git show origin/vllm/last-good-commit-for-vllm-gaudi:VLLM_STABLE_COMMIT) && \
+    echo "Pinning vLLM to $VLLM_COMMIT" && \
+    cd /opt/vllm && git checkout "$VLLM_COMMIT" && \
+    pip install -r <(sed '/^torch/d' requirements/build/cuda.txt) && \
+    VLLM_TARGET_DEVICE=empty pip install --no-build-isolation -e . && \
+    cd /opt/vllm-gaudi && pip install -e .
+WORKDIR /workspace

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hpu-moe-ext"
+version = "0.1.0"
+description = "Out-of-tree vLLM plugin: WNA16 GPTQ/AWQ FusedMoE method for Intel Gaudi (HPU), reusing VllmMixtureOfExpertsOpWNA16. Lets partially-quantized GPTQ/AWQ MoE checkpoints serve on vllm-gaudi without editing the installed engine."
+requires-python = ">=3.10"
+
+# Auto-discovered by vLLM via the general_plugins entry-point group.
+# Named with a "04." prefix so it loads AFTER the stock vllm-gaudi plugin
+# (whose entry points sort earlier), guaranteeing our overrides win.
+[project.entry-points."vllm.general_plugins"]
+"04.hpu_moe_ext" = "hpu_moe_ext:register"
+
+[tool.setuptools]
+packages = ["hpu_moe_ext"]

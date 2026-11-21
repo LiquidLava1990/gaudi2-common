@@ -1,0 +1,199 @@
+--- a/hpu_moe_ext/moe_wna16_hpu.py
++++ b/hpu_moe_ext/moe_wna16_hpu.py
+@@ -79,6 +79,70 @@
+ _ROUTED_DEBUG = os.environ.get("HPU_ROUTED_DEBUG") == "1"
+ _routed_dbg_count = [0]
+ 
++# === FUSED int4-MoE OpBackend op (item 2/4) ====================================
++# HPU_MOE_FUSED_OP=1 -> in the routed fast path replace the per-expert
++# convert_from_uint4 list -> mark_step -> mixture_of_experts tail (the bandwidth-
++# bound bf16-to-HBM round trip) with the GC-captured, SRAM-resident
++# torch.ops.hpu_moe_ext.fused_expert op, driven per-expert by the K-expert
++# wrapper hpu_moe_ext.fused_expert_routed.fused_moe_routed(...). Same eligibility
++# gate as the stock routed path (GPTQ-symmetric int4 only, tokens*top_k <= K), so
++# the fused op only ever sees the <=K distinct locally-routed experts. The stock
++# mixture_of_experts path stays the fallback when the flag is off.
++# HPU_MOE_FUSED_VERIFY=1 -> run BOTH (fused op vs the stock mixture_of_experts op)
++# every call and assert relNorm < 1e-2, LOUD on mismatch (mirrors the existing
++# HPU_MOE_ROUTED_VERIFY harness; stays coherent by returning the stock result).
++_FUSED_OP = os.environ.get("HPU_MOE_FUSED_OP") == "1"
++_FUSED_VERIFY = os.environ.get("HPU_MOE_FUSED_VERIFY") == "1"
++# Relative to this file: hpu_moe_ext/moe_wna16_hpu.py -> ../tpc_kernel/opbackend/build/...
++_FUSED_SO = os.path.normpath(os.path.join(
++    os.path.dirname(os.path.abspath(__file__)),
++    "..", "tpc_kernel", "opbackend", "build", "libmoe_fused_expert.so"))
++# Load the .so exactly once, lazily, the first time the fused path is taken (NOT at
++# import) so a CPU-only `import hpu_moe_ext` — and every non-fused serve — never
++# touches it. LOUD if the flag is on but the .so is missing or the op fails to
++# register: the fused path was explicitly requested, so a silent fallback would hide
++# a broken build. Returns the callable torch.ops.hpu_moe_ext.fused_expert handle.
++_fused_op_loaded = [False]
++
++
++def _load_fused_op():
++    """Load libmoe_fused_expert.so once and return torch.ops.hpu_moe_ext.fused_expert.
++    LOUD (RuntimeError) if HPU_MOE_FUSED_OP is on but the .so is absent / the op does
++    not register. Idempotent: re-loading the same library is a torch no-op, but we
++    short-circuit after the first success so the registration check runs only once."""
++    if not _fused_op_loaded[0]:
++        if not os.path.isfile(_FUSED_SO):
++            raise RuntimeError(
++                "hpu-moe-ext: HPU_MOE_FUSED_OP=1 but the fused-expert op library is "
++                f"missing:\n  {_FUSED_SO}\nBuild it (CPU-only, inside the image) with "
++                "`bash tpc_kernel/opbackend/build.sh`, or unset HPU_MOE_FUSED_OP.")
++        torch.ops.load_library(_FUSED_SO)
++        if not (hasattr(torch.ops, "hpu_moe_ext")
++                and hasattr(torch.ops.hpu_moe_ext, "fused_expert")):
++            raise RuntimeError(
++                "hpu-moe-ext: loaded "
++                f"{_FUSED_SO}\nbut torch.ops.hpu_moe_ext.fused_expert did NOT register "
++                "(check TORCH_LIBRARY(hpu_moe_ext) + the .so build).")
++        import logging
++        logging.getLogger("vllm").info(
++            "hpu-moe-ext: loaded fused-expert op from %s "
++            "(HPU_MOE_FUSED_OP=1, verify=%s)", _FUSED_SO, _FUSED_VERIFY)
++        _fused_op_loaded[0] = True
++    return torch.ops.hpu_moe_ext.fused_expert
++
++
++# The fused-expert path is the per-K-expert replacement for the routed fast path, so
++# it is ONLY reachable inside the `_ROUTED_K > 0` gate (that gate is what GUARANTEES
++# #distinct local experts <= K — the static-shape / no-host-sync invariant the fused
++# op relies on). HPU_MOE_FUSED_OP=1 without HPU_MOE_ROUTED_K>0 would be a silent no-op
++# (the routed branch never runs), so warn LOUDLY once at import.
++if _FUSED_OP and _ROUTED_K <= 0:
++    import logging as _fused_logging
++    _fused_logging.getLogger("vllm").warning(
++        "hpu-moe-ext: HPU_MOE_FUSED_OP=1 but HPU_MOE_ROUTED_K is unset/0 -> the fused "
++        "routed path is NEVER taken (it lives inside the routed-gather gate). Set "
++        "HPU_MOE_ROUTED_K=<K> (e.g. the model top_k) to enable it.")
++
+ # Set True by the MLA-absorption monkeypatch (hpu-dsa-ext/deq_weight_move) DURING load only, so
+ # GPTQDequantToBF16.apply flushes (defrags) around the absorption's weight extraction — which OOMs
+ # on the fragmented :next pool. MUST stay False during inference (a mark_step inside the decode
+@@ -615,6 +679,81 @@
+                                     active, remap, remapped, safe_w, valid, routed_out)
+         return routed_out
+ 
++    def _fused_moe_routed(self, layer, x, topk_ids, topk_weights, act, K):
++        """FUSED-OP routed path (HPU_MOE_FUSED_OP=1). Same eligibility + routing as
++        _routed_moe, but the dequant+GEMM tail is the GC-captured, SRAM-resident
++        torch.ops.hpu_moe_ext.fused_expert op (driven per-expert by the K-expert
++        wrapper hpu_moe_ext.fused_expert_routed.fused_moe_routed). Returns the output
++        tensor, or None if ineligible (AWQ per-expert zp) — caller then falls back.
++
++        === STORED-LAYOUT -> OP-CONTRACT MAPPING (the whole point of this method) ===
++        fused_moe_routed takes the SAME stacked [E,...] tensors the stock routed path
++        already stashes on `layer`, in exactly the op's PyTorch-row-major layout —
++        because both the fused op's internal dequantize_4_bit_bf16 and the stock path's
++        torch.ops.hpu.convert_from_uint4 are the SAME intrinsic (proven byte-identical
++        in tpc_kernel/opbackend/test_fused_expert_op.py). The packed weights + scales
++        therefore pass straight through with NO transpose/reshape:
++
++          plugin tensor (stacked; the wrapper index_selects K, op uses each slice)
++          ----------------------------------------------------  ->  op per-expert contract
++          layer.w13_qweight  [E, H,    2I/8] int32 (_repack_weight)  w13_packed [H,    2I/8]
++          layer.w13_scales   [E, H/GS, 2I  ] bf16  (.transpose(1,2)) w13_scale  [H/GS, 2I  ]
++          layer.w2_qweight   [E, I,    H/8 ] int32 (_repack_weight)  w2_packed  [I,    H/8 ]
++          layer.w2_scales    [E, I/GS, H   ] bf16  (.transpose(1,2)) w2_scale   [I/GS, H   ]
++
++        WHY the weights/scales match by construction (see process_weights_after_loading):
++          * _repack_weight returns [E, in, out//8]: w13 loads uint8 [E, out=2I, in=H//2]
++            -> [E, H, 2I/8]; w2 loads [E, out=H, in=I//2] -> [E, I, H/8]. Exactly the
++            packed shapes the op derives (w13 out=2I, w2 out=H).
++          * scales load [E, out, num_groups], .transpose(1,2) -> [E, groups, out] ==
++            op's [H/GS, 2I] / [I/GS, H].
++
++        === ZERO-POINT: the ONE shape adaptation needed ===
++        fused_moe_routed expects a STACKED per-expert zp w13_zp[E, H/GS, 2I/8] /
++        w2_zp[E, I/GS, H/8] (it does w13_zp.index_select(0, active) alongside the
++        weights, so the contract works for AWQ per-expert zeros too — see its docstring).
++        But the plugin's GPTQ-symmetric zero is a SINGLE SHARED 2D tensor
++        [H/GS, 2I/8] / [I/GS, H/8] (_sym_zero -> packed midpoint 8 == 0x88888888),
++        stashed as layer._hpu_routed_w13_zp / _hpu_routed_w2_zp (None for AWQ). Passing
++        that 2D tensor unchanged would make the wrapper's index_select(0, active) index
++        the GROUPS dim, not experts -> wrong slice. So we BROADCAST the shared zero to
++        [E, groups, out//8] (every expert identical for GPTQ-sym) and cache it on the
++        layer (built once; the zp is tiny — ~3 MB for GLM-5.1 — and identical across all
++        decode steps, so no per-token allocation). .contiguous() so index_select reads a
++        real per-expert stride, not a stride-0 broadcast dim. AWQ (w13z is None) is
++        rejected up front and falls back, identical to _routed_moe's gate.
++
++        E (num_local_experts) and I (moe_intermediate) are derived INSIDE
++        fused_moe_routed from the stacked tensors, so the call passes only experts_min +
++        K — matching the documented entrypoint signature. The wrapper owns all
++        gather/route/remap/clone HPU-graph-safety (it mirrors _routed_moe verbatim) and
++        calls the per-expert op K times (router_weight folded into the op's final mult)."""
++        w13z = layer._hpu_routed_w13_zp
++        w2z = layer._hpu_routed_w2_zp
++        if w13z is None:
++            return None  # AWQ per-expert zp -> ineligible (same as _routed_moe)
++        if act != "silu":
++            return None  # the fused-expert graph hard-codes silu(gate)*up
++        _load_fused_op()  # LOUD if the requested .so is missing / fails to register
++        from .fused_expert_routed import fused_moe_routed
++        emin = layer._hpu_experts_min
++        E = layer._hpu_local_experts
++        # Broadcast the shared GPTQ-sym zero [groups, out//8] -> stacked [E, groups,
++        # out//8] ONCE and cache it (identical for every expert + every decode step).
++        w13z_stacked = getattr(layer, "_hpu_fused_w13_zp", None)
++        if w13z_stacked is None or w13z_stacked.shape[0] != E:
++            w13z_stacked = w13z.unsqueeze(0).expand(E, *w13z.shape).contiguous()
++            w2z_stacked = w2z.unsqueeze(0).expand(E, *w2z.shape).contiguous()
++            layer._hpu_fused_w13_zp = w13z_stacked
++            layer._hpu_fused_w2_zp = w2z_stacked
++        else:
++            w2z_stacked = layer._hpu_fused_w2_zp
++        return fused_moe_routed(
++            x,
++            layer.w13_qweight.data, layer.w13_scales.data, w13z_stacked,
++            layer.w2_qweight.data, layer.w2_scales.data, w2z_stacked,
++            topk_ids, topk_weights, emin, K)
++
+     @torch.compiler.disable
+     def _routed_debug_dump(self, layer, x, topk_ids, topk_weights, perm, act,
+                            active, remap, remapped, safe_w, valid, routed_out):
+@@ -685,6 +824,43 @@
+         # i.e. tokens*top_k <= K) and eligible (GPTQ-sym). Else fall through to all-expert op.
+         if _ROUTED_K > 0 and (x.shape[0] * layer.top_k) <= _ROUTED_K \
+                 and getattr(layer, "_hpu_routed_w13_zp", None) is not None:
++            # FUSED-OP path (HPU_MOE_FUSED_OP=1): replace the convert_from_uint4-list ->
++            # mark_step -> mixture_of_experts tail with the GC-captured fused_expert op
++            # (driven per-expert by fused_moe_routed). SAME eligibility gate as the stock
++            # routed path above + GPTQ-sym int4 (None zp -> AWQ -> falls through). When the
++            # op is ineligible for this layer (AWQ/non-silu) _fused_moe_routed returns None
++            # and we drop to the stock _routed_moe below — never silently to a worse path.
++            if _FUSED_OP:
++                fused = self._fused_moe_routed(layer, x, tid, tw_, act, _ROUTED_K)
++                if fused is not None:
++                    if _FUSED_VERIFY:
++                        # ref = the STOCK routed path (convert_from_uint4 + the proven
++                        # mixture_of_experts intrinsic) — bit-exact-equivalent to the
++                        # all-expert op by _routed_moe's own HPU_MOE_ROUTED_VERIFY proof,
++                        # so it is the right oracle for the fused op. relNorm < 1e-2 is the
++                        # bf16 norm-relative tol the fused-op recipe was validated against
++                        # (test_fused_expert_op.py); LOUD + stay-coherent (return stock) on
++                        # mismatch, mirroring the routed-verify harness.
++                        ref = self._routed_moe(layer, x, tid, tw_, perm, act, _ROUTED_K)
++                        import logging
++                        if ref is None:
++                            logging.getLogger("vllm").warning(
++                                "[fused-verify] stock ref unavailable (ineligible); "
++                                "skipping verify, using fused result")
++                            return fused.view(*input_shape)
++                        diff = (fused.float() - ref.float()).norm().item()
++                        rn = diff / (ref.float().norm().item() + 1e-9)
++                        if rn >= 1e-2:
++                            ma = (fused.float() - ref.float()).abs().max().item()
++                            logging.getLogger("vllm").warning(
++                                "[fused-verify] MISMATCH relNorm=%.4g maxAbs=%.4g x0=%d "
++                                "-- falling back to stock mixture_of_experts result"
++                                % (rn, ma, x.shape[0]))
++                            return ref.view(*input_shape)   # stay coherent; no crash
++                        logging.getLogger("vllm").info(
++                            "[fused-verify] relNorm=%.6g x0=%d" % (rn, x.shape[0]))
++                    return fused.view(*input_shape)
++                # fall through to stock routed path (AWQ / non-silu ineligible)
+             routed = self._routed_moe(layer, x, tid, tw_, perm, act, _ROUTED_K)
+             if routed is not None:
+                 if _ROUTED_VERIFY:

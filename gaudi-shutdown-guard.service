@@ -1,0 +1,14 @@
+[Unit]
+Description=Free Gaudi vLLM + /mnt/data1 before shutdown (prevents unmount hang)
+DefaultDependencies=no
+Before=shutdown.target umount.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=$HOME/AI/shutdown_guard.sh
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

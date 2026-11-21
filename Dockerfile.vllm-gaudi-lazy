@@ -1,0 +1,19 @@
+# vLLM-Gaudi LAZY-capable serving image (Phase 2c): built on the Habana FORK
+# PyTorch 2.10 base (pytorch-installer-2.10.0, NOT the upstream one) which supports
+# PT_HPU_LAZY_MODE=1 -> HPU-graph capture + auto lazy collectives. Identical vLLM +
+# Gaudi-plugin build as :1.24 (only the FROM differs). Tag -> vllm-gaudi:next, GATE
+# before promoting (HCCL world=4&8, plugin registers, coherence, tok/s vs 5.77).
+FROM vault.habana.ai/gaudi-docker/1.24.0/ubuntu24.04/habanalabs/pytorch-installer-2.10.0:latest
+SHELL ["/bin/bash", "-c"]
+# Pin vLLM to the exact commit the gaudi plugin was validated against, build it device-agnostic,
+# then install the Gaudi hardware plugin on top.
+RUN git clone https://github.com/vllm-project/vllm-gaudi /opt/vllm-gaudi && \
+    git clone https://github.com/vllm-project/vllm /opt/vllm && \
+    cd /opt/vllm-gaudi && \
+    VLLM_COMMIT=$(git show origin/vllm/last-good-commit-for-vllm-gaudi:VLLM_STABLE_COMMIT) && \
+    echo "Pinning vLLM to $VLLM_COMMIT" && \
+    cd /opt/vllm && git checkout "$VLLM_COMMIT" && \
+    pip install -r <(sed '/^torch/d' requirements/build/cuda.txt) && \
+    VLLM_TARGET_DEVICE=empty pip install --no-build-isolation -e . && \
+    cd /opt/vllm-gaudi && pip install -e .
+WORKDIR /workspace

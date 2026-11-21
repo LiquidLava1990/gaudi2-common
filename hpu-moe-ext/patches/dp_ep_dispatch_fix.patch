@@ -1,0 +1,229 @@
+diff --git a/hpu_moe_ext/moe_wna16_hpu.py b/hpu_moe_ext/moe_wna16_hpu.py
+index a70e342..41f2787 100644
+--- a/hpu_moe_ext/moe_wna16_hpu.py
++++ b/hpu_moe_ext/moe_wna16_hpu.py
+@@ -86,6 +86,103 @@ _routed_dbg_count = [0]
+ _DEQ_ABSORB = [False]
+ 
+ 
++# ============================================================================
++# DP+EP global<->local expert-id mapping  (root-cause fix; see block below)
++# ============================================================================
++# ROOT CAUSE (the IndexError that BLOCKS DP2xTP4 — "a GLOBAL expert id indexing a
++# LOCAL <local_num_experts>-element parameter"):
++#
++#   This method shards experts with EXPERT-PARALLEL: every rank holds only
++#   `layer.local_num_experts` of the `global_num_experts` experts, and the HPU
++#   `mixture_of_experts` op + the stacked w13/w2/scales params are sized to that
++#   LOCAL count (e.g. 32 at TP=4, or 16 under DP2xTP4 flatten). The router still
++#   emits GLOBAL expert ids in [0, global_num_experts), so before the op runs we
++#   must map each GLOBAL id to this rank's LOCAL slot [0, local_num_experts) (or
++#   drop it as "not mine").
++#
++#   The ORIGINAL code derived that mapping from a HARDCODED contiguous-linear
++#   assumption:
++#         ep_shift     = layer.ep_rank * layer.local_num_experts
++#         experts_min  = ep_shift
++#         local_id     = global_id - experts_min            # in apply/_routed_moe
++#   i.e. it ASSUMES this rank owns the contiguous global block
++#   [ep_rank*E, ep_rank*E + E). That is true ONLY for placement_strategy="linear"
++#   with global_num_experts % ep_size == 0 AND when ep_rank*E equals the start
++#   index ExpertMapManager actually baked into `layer.expert_map`.
++#
++#   Under DATA-PARALLEL + EP that assumption BREAKS. vLLM's FusedMoEParallelConfig
++#   FLATTENS expert-parallel across DP x TP (config.py: `ep_size = dp_size*tp_size`,
++#   `ep_rank = dp_rank*tp_size + tp_rank`), while each DP replica is a SEPARATE
++#   engine that only initialises its own TP process group. So `layer.ep_rank`
++#   (flattened) and the per-replica `layer.expert_map`'s real start index no
++#   longer satisfy  start_idx == ep_rank * local_num_experts. The subtract-emin
++#   remap then yields a LOCAL id OUTSIDE [0, local_num_experts) for genuinely-
++#   routed experts -> that id indexes the LOCAL-sized op weight list / stacked
++#   param out of range -> IndexError at load/first-forward (and, where it doesn't
++#   raise, silently wrong experts). EP-only (no DP) happens to satisfy the
++#   contiguous assumption, which is why it worked and DP2xTP4 did not.
++#
++# FIX: stop re-deriving the window arithmetically. `layer.expert_map` is the
++# AUTHORITATIVE [global_num_experts] int32 buffer that ExpertMapManager built and
++# that the upstream weight-loader ALREADY used to PLACE these weights:
++#       expert_map[g] = local_id in [0, local_num_experts)   if g is on this rank
++#       expert_map[g] = -1                                   otherwise
++# Mapping GLOBAL->LOCAL by gathering through expert_map is correct for linear,
++# round_robin, contiguous AND the DP+EP flattened layout, by construction (it is
++# the same map the weights were loaded with). We stash it on the layer and use a
++# gather-based remap in apply_monolithic / _routed_moe. The old ep_shift formula
++# is kept ONLY as the fallback for the no-EP case (expert_map is None, ep_size==1),
++# where experts_min is 0 and global==local anyway.
++
++def _ep_remap_meta(layer):
++    """Return (experts_min, expert_map_or_None) for this rank under EP.
++
++    expert_map (when not None) is the authoritative [global_num_experts] int32
++    buffer with expert_map[g] = local_id or -1. experts_min is the smallest
++    GLOBAL id this rank owns (informational / probe + the subtract-emin fallback).
++
++    Prefers layer.expert_map. Falls back to the contiguous formula
++    ep_rank*local_num_experts ONLY when no expert_map exists (EP disabled)."""
++    E = int(layer.local_num_experts)
++    emap = getattr(layer, "expert_map", None)
++    if emap is not None:
++        owned = (emap >= 0).nonzero().flatten()
++        # smallest global id mapped to a local slot; 0 if (defensively) none.
++        experts_min = int(owned[0].item()) if owned.numel() > 0 else 0
++        return experts_min, emap
++    # No EP (ep_size == 1): global ids ARE local ids; contiguous formula degenerates
++    # to ep_rank(0)*E = 0. Keep ep_rank*E for any exotic no-map EP path.
++    experts_min = int(getattr(layer, "ep_rank", 0)) * E
++    return experts_min, None
++
++
++def _remap_global_to_local(tid, tw, layer):
++    """Map GLOBAL expert ids `tid` -> this rank's LOCAL slots, zeroing the router
++    weight `tw` for non-local experts so they contribute exactly 0 (mirrors the
++    out-of-window-id handling). Returns (local_tid, masked_tw).
++
++    Uses the stashed authoritative expert_map (`_hpu_expert_map`) when present:
++    a gather `expert_map[global_id]` gives the true local id (or -1); -1 entries
++    are remapped to local slot 0 with weight zeroed. Correct for ANY placement /
++    flatten. Without a map (no EP), `tid` already is local."""
++    import torch as _torch
++    emap = getattr(layer, "_hpu_expert_map", None)
++    if emap is None:
++        return tid, tw  # no EP: global == local
++    tid64 = tid.to(_torch.int64)
++    if emap.device != tid64.device:
++        emap = emap.to(tid64.device)
++        layer._hpu_expert_map = emap  # cache the moved copy
++    G = emap.shape[0]
++    in_range = (tid64 >= 0) & (tid64 < G)
++    safe_gid = _torch.where(in_range, tid64, _torch.zeros_like(tid64))
++    local = emap.to(_torch.int64).index_select(0, safe_gid.reshape(-1)).view_as(tid64)
++    is_local = in_range & (local >= 0)               # -1 (not mine) or out-of-range -> drop
++    local_tid = _torch.where(is_local, local, _torch.zeros_like(local))
++    masked_tw = _torch.where(is_local, tw, _torch.zeros_like(tw))
++    return local_tid, masked_tw
++
++
+ def _hpu_to_cpu_chunked(t, target_bytes=1_048_576):
+     """Move an HPU tensor to CPU in BYTE-sized row-chunks (~1MB each, regardless of the row
+     width) so each staging allocation fits a fragmented device pool block. A whole-tensor (or
+@@ -289,8 +386,14 @@ class MoeWNA16HPUMethod(MoeWNA16Method):
+         layer.w2_scales = torch.nn.Parameter(w2_scale, requires_grad=False)
+ 
+         num_experts = layer.local_num_experts
+-        ep_shift = layer.ep_rank * num_experts
+-        experts_min, experts_max = ep_shift, num_experts + ep_shift - 1
++        # DP+EP FIX: derive this rank's GLOBAL->LOCAL expert mapping from the
++        # AUTHORITATIVE layer.expert_map (not the contiguous ep_rank*E formula,
++        # which breaks under the DP+EP flatten — see _ep_remap_meta block above).
++        experts_min, _emap = _ep_remap_meta(layer)
++        experts_max = experts_min + num_experts - 1
++        # Stash the map so apply_monolithic / _routed_moe remap GLOBAL->LOCAL by
++        # gather (correct for linear / round_robin / DP+EP). None => no EP.
++        layer._hpu_expert_map = _emap
+         # GLM-5.1 / EP FIX: the HPU mixture_of_experts intrinsic returns ~0 for the routed
+         # experts when experts_min != 0 (non-zero GLOBAL window under expert-parallel) — the
+         # routed contribution silently vanishes -> only the shared expert survives -> token
+@@ -423,8 +526,16 @@ class MoeWNA16HPUMethod(MoeWNA16Method):
+         cached = repack_cache.load_layer_to_device(layer, repack_cache.load_dir())  # CPU tensors
+ 
+         num_experts = layer.local_num_experts
+-        ep_shift = layer.ep_rank * num_experts
+-        experts_min, experts_max = ep_shift, num_experts + ep_shift - 1
++        # DP+EP FIX (mirror of process_weights_after_loading): authoritative
++        # expert_map, not the contiguous ep_rank*E formula. NOTE for the cache:
++        # the SAVE/LOAD cache is keyed by ep_rank+layer and stores this rank's
++        # local experts in their global-block ORDER; a cache minted under one
++        # EP layout (e.g. TP=8, 16/rank) must NOT be loaded under a different
++        # one (e.g. DP2xTP4, 32/rank) — mint a fresh cache per layout, or run
++        # DP2xTP4 with no repack cache (HPU_MOE_REPACK_LOAD unset).
++        experts_min, _emap = _ep_remap_meta(layer)
++        experts_max = experts_min + num_experts - 1
++        layer._hpu_expert_map = _emap
+         # SAME LOCAL-window op as the eager path (GLM-5.1 / EP global->local fix).
+         layer.moe_op = VllmMixtureOfExpertsOpWNA16(num_experts, 0, num_experts - 1)
+ 
+@@ -528,7 +639,24 @@ class MoeWNA16HPUMethod(MoeWNA16Method):
+         E = layer._hpu_local_experts
+         emin = layer._hpu_experts_min
+         dev = x.device
+-        local = topk_ids.to(torch.int64) - emin            # global expert id -> local [0,E)
++        # global expert id -> local [0,E). DP+EP FIX: when an authoritative expert_map is
++        # stashed, gather the true local id (non-local -> -1, which fails the (flat>=0)&(flat<E)
++        # validity test below exactly like an out-of-range subtract result). Else (no EP / no
++        # map) the contiguous subtract is exact. Keeps every downstream tensor identical.
++        _emap = getattr(layer, "_hpu_expert_map", None)
++        if _emap is not None:
++            if _emap.device != topk_ids.device:
++                _emap = _emap.to(topk_ids.device)
++                layer._hpu_expert_map = _emap
++            _gid = topk_ids.to(torch.int64)
++            _G = _emap.shape[0]
++            _ir = (_gid >= 0) & (_gid < _G)
++            _sg = torch.where(_ir, _gid, torch.zeros_like(_gid))
++            _lg = _emap.to(torch.int64).index_select(0, _sg.reshape(-1)).view_as(_gid)
++            # non-local (-1 from map) or out-of-range -> -1 so validity test drops it
++            local = torch.where(_ir, _lg, torch.full_like(_gid, -1))
++        else:
++            local = topk_ids.to(torch.int64) - emin
+         flat = local.reshape(-1)
+         valid = (flat >= 0) & (flat < E)                    # routed to a LOCAL expert?
+         flat_safe = torch.where(valid, flat, torch.zeros_like(flat))   # for gather; where()-masked below
+@@ -692,13 +820,17 @@ class MoeWNA16HPUMethod(MoeWNA16Method):
+                     # LOCAL window [0,nloc-1] (the EP global->local fix), so passing GLOBAL ids
+                     # makes ref ~0 routed and FALSELY rejects the (correct) _routed_moe. Mirror
+                     # the apply_monolithic remap here so ref is the true all-expert result.
+-                    _emin = getattr(layer, "_hpu_experts_min", 0)
+-                    _nloc = getattr(layer, "_hpu_local_experts", None)
+-                    _rtid, _rtw = tid, tw_
+-                    if _nloc is not None:
+-                        _iw = (tid >= _emin) & (tid < _emin + _nloc)
+-                        _rtid = torch.where(_iw, tid - _emin, torch.zeros_like(tid))
+-                        _rtw = torch.where(_iw, tw_, torch.zeros_like(tw_))
++                    # DP+EP FIX: remap via the authoritative map when present (else contiguous).
++                    if getattr(layer, "_hpu_expert_map", None) is not None:
++                        _rtid, _rtw = _remap_global_to_local(tid, tw_, layer)
++                    else:
++                        _emin = getattr(layer, "_hpu_experts_min", 0)
++                        _nloc = getattr(layer, "_hpu_local_experts", None)
++                        _rtid, _rtw = tid, tw_
++                        if _nloc is not None:
++                            _iw = (tid >= _emin) & (tid < _emin + _nloc)
++                            _rtid = torch.where(_iw, tid - _emin, torch.zeros_like(tid))
++                            _rtw = torch.where(_iw, tw_, torch.zeros_like(tw_))
+                     ref = layer.moe_op(x, _rtid, _rtw, permuted_weights=perm, activation=act)
+                     md = (routed.float() - ref.float()).abs().max().item()
+                     import logging
+@@ -709,19 +841,21 @@ class MoeWNA16HPUMethod(MoeWNA16Method):
+                     logging.getLogger("vllm").info("[routed-verify] maxdiff=%.6g" % md)
+                 return routed.view(*input_shape)
+         # GLM-5.1 / EP FIX (pairs with the LOCAL-window op above): remap GLOBAL expert ids ->
+-        # LOCAL [0, num_local-1] by subtracting this rank's expert offset; non-local experts ->
+-        # compact id 0 with weight ZEROED so they contribute exactly 0 (mirrors _routed_moe;
+-        # relying on out-of-window id skipping is unreliable per that path's note). Without this,
++        # LOCAL [0, num_local-1]; non-local experts -> compact id 0 with weight ZEROED so they
++        # contribute exactly 0 (the op does NOT cleanly skip out-of-window ids). Without this,
+         # global ids never match the op's local weight list -> routed output 0 -> salad.
+-        emin = getattr(layer, "_hpu_experts_min", 0)
+-        nloc = getattr(layer, "_hpu_local_experts", None)
+-        if nloc is not None:
+-            # Applies to ALL ranks incl. ep_rank 0 (emin=0): the op does NOT cleanly skip
+-            # out-of-[0,nloc) global ids, so non-local experts must have their WEIGHT zeroed
+-            # (tid->compact 0). The tid-emin subtraction is a harmless no-op when emin=0.
+-            in_win = (tid >= emin) & (tid < emin + nloc)
+-            tid = torch.where(in_win, tid - emin, torch.zeros_like(tid))
+-            tw_ = torch.where(in_win, tw_, torch.zeros_like(tw_))
++        # DP+EP FIX: when an authoritative expert_map is stashed, remap by GATHER through it
++        # (correct for linear / round_robin / the DP+EP flatten). Else (no EP) global == local.
++        if getattr(layer, "_hpu_expert_map", None) is not None:
++            tid, tw_ = _remap_global_to_local(tid, tw_, layer)
++        else:
++            # Legacy contiguous fallback (no expert_map): subtract this rank's emin.
++            emin = getattr(layer, "_hpu_experts_min", 0)
++            nloc = getattr(layer, "_hpu_local_experts", None)
++            if nloc is not None:
++                in_win = (tid >= emin) & (tid < emin + nloc)
++                tid = torch.where(in_win, tid - emin, torch.zeros_like(tid))
++                tw_ = torch.where(in_win, tw_, torch.zeros_like(tw_))
+         out = layer.moe_op(x, tid, tw_, permuted_weights=perm, activation=act)
+         if _PROBE_N > 0:
+             _probe_count[0] += 1

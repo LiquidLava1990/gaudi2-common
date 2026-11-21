@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hpu-dsa-ext"
+version = "0.1.0"
+description = "HPU DeepSeek Sparse Attention (DSA) overlay for vllm-gaudi — runs sparse-as-designed (GLM-5.1 GlmMoeDsa, DeepSeek-V3.2). Out-of-tree, zero installed-file edits."
+requires-python = ">=3.10"
+
+# Loads after stock vllm-gaudi and after hpu-moe-ext ("04.") so our overrides win.
+[project.entry-points."vllm.general_plugins"]
+"05.hpu_dsa_ext" = "hpu_dsa_ext:register"
+
+[tool.setuptools]
+packages = ["hpu_dsa_ext"]
